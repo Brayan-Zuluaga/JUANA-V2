@@ -1,9 +1,7 @@
-using DocumentFormat.OpenXml;
 using System.Net;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Wordprocessing;
 using Microsoft.Azure.Functions.Worker;
@@ -21,75 +19,36 @@ public class CompareReports
         _logger = loggerFactory.CreateLogger<CompareReports>();
     }
 
-    // ====== DTOs ======
-    public record CompareRequest(
+    public record RequestDto(
         string baselineDocxBase64,
         string currentDocxBase64,
-        Options? options,
-        Metadata? metadata
+        string? author,
+        string? initials,
+        bool? includeDeletedComments,   // default true
+        double? tokenChangeThreshold,   // default 0.35
+        double? itemMatchThreshold      // default 0.72
     );
 
-    public record Options(
-        string? mode,               // MVP: "delta_document"
-        bool? significantOnly,      // true => omite sin cambios
-        bool? includeHighlights,    // true => agrega sección de cambios
-        int? maxHighlights          // ej: 12
-    );
+    private class Item
+    {
+        public string Title { get; set; } = "";
+        public string Client { get; set; } = "";
+        public string Description { get; set; } = "";
+        public int AnchorTitle { get; set; } = 0;
 
-    public record Metadata(
-        string? gerente,
-        string? mercado,
-        string? baselineDate,
-        string? currentDate
-    );
+        public string Signature => $"{Client} {Title}".Trim();
+    }
 
-    public record CompareResponse(
-        string fileName,
-        string docxBase64,
-        Summary summary
-    );
+    public record ChangeItem(string Tag, string Message, int AnchorIndex);
 
-    public record Summary(
-        int critical,
-        int high,
-        int medium,
-        int low,
-        int newRisk,
-        int updated,
-        int noChange
-    );
-
-    // ====== Modelo interno ======
-    public record Block(
-        string itemKey,
-        string title,
-        string body,
-        bool hasRiskFlag,
-        bool isSinNovedad
-    );
-
-    public enum Severity { Low, Medium, High, Critical }
-    public enum Tag { NoChange, Updated, NewRisk, New }
-
-    public record DeltaItem(
-        string itemKey,
-        string title,
-        Tag tag,
-        Severity severity,
-        string note,
-        Block? previous,
-        Block current
-    );
-
-    // ====== Function ======
     [Function("CompareReports")]
     public async Task<HttpResponseData> Run(
         [HttpTrigger(AuthorizationLevel.Function, "post")] HttpRequestData req)
     {
         try
         {
-            var body = await new StreamReader(req.Body).ReadToEndAsync();
-            var input = JsonSerializer.Deserialize<CompareRequest>(body, new JsonSerializerOptions
+            var raw = await new StreamReader(req.Body).ReadToEndAsync();
+            var input = JsonSerializer.Deserialize<RequestDto>(raw, new JsonSerializerOptions
             {
                 PropertyNameCaseInsensitive = true
             });
@@ -103,312 +62,535 @@ public class CompareReports
                 return bad;
             }
 
-            var opts = input.options ?? new Options(
-                mode: "delta_document",
-                significantOnly: true,
-                includeHighlights: true,
-                maxHighlights: 12
-            );
+            var author = string.IsNullOrWhiteSpace(input.author) ? "JUANA" : input.author!;
+            var initials = string.IsNullOrWhiteSpace(input.initials) ? "J" : input.initials!;
+            var includeDeleted = input.includeDeletedComments ?? true;
 
-            // 1) DOCX -> texto
-            var baselineText = ExtractTextFromDocxBase64(input.baselineDocxBase64);
-            var currentText  = ExtractTextFromDocxBase64(input.currentDocxBase64);
+            var tokenThreshold = (input.tokenChangeThreshold is > 0 and <= 1) ? input.tokenChangeThreshold.Value : 0.35;
+            var matchThreshold = (input.itemMatchThreshold is > 0 and <= 1) ? input.itemMatchThreshold.Value : 0.72;
 
-            // 2) Texto -> bloques
-            var baselineBlocks = SplitIntoBlocks(baselineText);
-            var currentBlocks  = SplitIntoBlocks(currentText);
+            // ✅ baseline = v1 (antigua), current = v2 (nueva)
+            var v1 = Convert.FromBase64String(input.baselineDocxBase64);
+            var v2 = Convert.FromBase64String(input.currentDocxBase64);
 
-            // 3) Comparación
-            var deltas = Compare(baselineBlocks, currentBlocks);
+            var v1Items = ExtractItems_TitlePlusDescription(v1, includeAnchors: false);
+            var v2Items = ExtractItems_TitlePlusDescription(v2, includeAnchors: true);
 
-            // 4) Generación DOCX resultado
-            var outBytes = BuildDeltaDocx(deltas, input.metadata, opts);
+            var matches = MatchItemsBySimilarity(v1Items, v2Items, matchThreshold);
+            var matchedV1 = new HashSet<int>(matches.Values);
+            var matchedV2 = new HashSet<int>(matches.Keys);
 
-            var response = new CompareResponse(
-                fileName: BuildFileName(input.metadata),
-                docxBase64: Convert.ToBase64String(outBytes),
-                summary: BuildSummary(deltas)
-            );
+            var changes = new List<ChangeItem>();
 
-            var ok = req.CreateResponse(HttpStatusCode.OK);
-            ok.Headers.Add("Content-Type", "application/json; charset=utf-8");
-            await ok.WriteStringAsync(JsonSerializer.Serialize(response));
-            return ok;
+            // ✅ NUEVOS
+            for (int i2 = 0; i2 < v2Items.Count; i2++)
+            {
+                if (matchedV2.Contains(i2)) continue;
+                var it = v2Items[i2];
+
+                changes.Add(new ChangeItem(
+                    "[NUEVO]",
+                    $"{SafeTitle(it)}. Este bloque aparece en v2 y no estaba en v1.",
+                    it.AnchorTitle
+                ));
+            }
+
+            // ✅ ELIMINADOS
+            if (includeDeleted)
+            {
+                for (int i1 = 0; i1 < v1Items.Count; i1++)
+                {
+                    if (matchedV1.Contains(i1)) continue;
+                    var it = v1Items[i1];
+
+                    var anchor = FindAnchorByClient(v2Items, it.Client) ?? 0;
+
+                    changes.Add(new ChangeItem(
+                        "[ELIMINADO]",
+                        $"{SafeTitle(it)}. Estaba en v1 y ya no aparece en v2.",
+                        anchor
+                    ));
+                }
+            }
+
+            // ✅ ACTUALIZACIONES
+            foreach (var kv in matches)
+            {
+                var it2 = v2Items[kv.Key];
+                var it1 = v1Items[kv.Value];
+
+                // 1) números (% y €) con dirección correcta
+                var numericMsgs = CompareNumbers_Directional(it1.Description, it2.Description);
+
+                foreach (var msg in numericMsgs)
+                {
+                    changes.Add(new ChangeItem(
+                        "[ACTUALIZACION]",
+                        $"{SafeTitle(it2)}. {msg}",
+                        it2.AnchorTitle
+                    ));
+                }
+
+                // 2) si no hay números, token delta (umbral)
+                if (numericMsgs.Count == 0)
+                {
+                    var delta = TokenDelta(it1.Description, it2.Description);
+                    if (delta.ChangeRatio >= tokenThreshold)
+                    {
+                        changes.Add(new ChangeItem(
+                            "[ACTUALIZACION]",
+                            $"{SafeTitle(it2)}. Cambios relevantes en el texto. Añadidos: {delta.AddedSummary}. Eliminados: {delta.RemovedSummary}.",
+                            it2.AnchorTitle
+                        ));
+                    }
+                }
+            }
+
+            // ✅ limpiar comentarios existentes y dejar solo JUANA
+            var updated = ReplaceAllCommentsWithJuana(v2, changes, author, initials);
+
+            var res = req.CreateResponse(HttpStatusCode.OK);
+            res.Headers.Add("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+            res.Headers.Add("Content-Disposition", "attachment; filename=\"v2_con_comentarios.docx\"");
+            await res.Body.WriteAsync(updated, 0, updated.Length);
+            return res;
+        }
+        catch (FormatException)
+        {
+            var bad = req.CreateResponse(HttpStatusCode.BadRequest);
+            await bad.WriteStringAsync("Base64 inválido (baselineDocxBase64 o currentDocxBase64).");
+            return bad;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "CompareReports failed");
             var err = req.CreateResponse(HttpStatusCode.InternalServerError);
-            await err.WriteStringAsync($"Error: {ex.Message}");
+            await err.WriteStringAsync(ex.Message);
             return err;
         }
     }
 
-    // ====== 1) DOCX -> texto ======
-    private static string ExtractTextFromDocxBase64(string base64)
+    // =========================================================
+    // NORMALIZACIÓN (guiones raros –/—)
+    // =========================================================
+    private static string NormalizeDashes(string s)
     {
-        var bytes = Convert.FromBase64String(base64);
-        using var ms = new MemoryStream(bytes);
+        if (string.IsNullOrWhiteSpace(s)) return "";
+        return s.Replace('–', '-').Replace('—', '-');
+    }
+
+    private static bool HasDashSeparator(string t)
+    {
+        t = NormalizeDashes(t);
+        // " - " o guiones pegados (CRT-)
+        return t.Contains(" - ") || t.Contains('-');
+    }
+
+    private static string GetClientFromTitle(string t)
+    {
+        t = NormalizeDashes(t);
+
+        // preferir split por " - "
+        var parts = t.Split(new[] { " - " }, StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2) return parts[0].Trim();
+
+        // fallback: primer segmento antes del primer '-'
+        var idx = t.IndexOf('-');
+        if (idx > 0) return t.Substring(0, idx).Trim();
+
+        return "";
+    }
+
+    // =========================================================
+    // EXTRACCIÓN: título + descripción (1..3 párrafos después)
+    // =========================================================
+    private static List<Item> ExtractItems_TitlePlusDescription(byte[] docxBytes, bool includeAnchors)
+    {
+        using var ms = new MemoryStream(docxBytes);
         using var doc = WordprocessingDocument.Open(ms, false);
 
-        var sb = new StringBuilder();
         var body = doc.MainDocumentPart?.Document?.Body;
-        if (body == null) return "";
+        if (body == null) return new();
 
-        foreach (var para in body.Elements<Paragraph>())
+        var paragraphs = body.Elements<Paragraph>().ToList();
+        var items = new List<Item>();
+
+        for (int i = 0; i < paragraphs.Count - 1; i++)
         {
-            var text = para.InnerText?.Trim();
-            sb.AppendLine(text ?? "");
-        }
-        return sb.ToString();
-    }
+            var title = NormalizeDashes(Clean(paragraphs[i].InnerText));
+            if (string.IsNullOrWhiteSpace(title)) continue;
 
-    // ====== 2) Texto -> bloques ======
-    private static List<Block> SplitIntoBlocks(string text)
-    {
-        var rawBlocks = Regex.Split(text, @"\n\s*\n")
-            .Select(b => b.Trim())
-            .Where(b => b.Length > 0)
-            .ToList();
+            if (IsSectionOrCategoryTitle(title)) continue;
+            if (!LooksLikeRealItemTitle(title)) continue;
 
-        var blocks = new List<Block>();
-
-        foreach (var raw in rawBlocks)
-        {
-            var lines = raw.Split('\n')
-                .Select(l => l.Trim())
-                .Where(l => l.Length > 0)
-                .ToList();
-
-            var title = GuessTitle(lines);
-            var hasRisk = Regex.IsMatch(raw, @"\b\[?RIESGO\]?\b", RegexOptions.IgnoreCase);
-            var sinNovedad = Regex.IsMatch(raw, @"\bsin novedad\b", RegexOptions.IgnoreCase);
-
-            var keySeed = Normalize(title);
-            if (keySeed.Length < 8)
-                keySeed = Normalize(lines.FirstOrDefault() ?? raw[..Math.Min(raw.Length, 60)]);
-
-            var key = Sha1(keySeed);
-
-            blocks.Add(new Block(key, title, raw, hasRisk, sinNovedad));
-        }
-
-        return blocks;
-    }
-
-    private static string GuessTitle(List<string> lines)
-    {
-        var titleParts = new List<string>();
-
-        foreach (var l in lines.Take(6))
-        {
-            if (Regex.IsMatch(l, @"^(seguimiento|fecha:|inditex|general|vertical|squad|área|datos global|partners|otros varios)",
-                RegexOptions.IgnoreCase))
+            // buscar descripción en los próximos 3 párrafos
+            string desc = "";
+            for (int j = i + 1; j <= Math.Min(i + 3, paragraphs.Count - 1); j++)
             {
-                titleParts.Add(l);
+                var candidate = Clean(paragraphs[j].InnerText);
+                if (string.IsNullOrWhiteSpace(candidate)) continue;
+                if (IsSectionOrCategoryTitle(candidate)) break;
+
+                if (LooksLikeDescription(candidate))
+                {
+                    desc = candidate;
+                    break;
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(desc)) continue;
+
+            var it = new Item
+            {
+                Title = title,
+                Description = desc,
+                AnchorTitle = includeAnchors ? i : 0,
+                Client = GetClientFromTitle(title)
+            };
+
+            items.Add(it);
+        }
+
+        return items;
+    }
+
+    private static bool LooksLikeDescription(string text)
+    {
+        return text.Length >= 80 && text.Contains(' ');
+    }
+
+    private static bool LooksLikeRealItemTitle(string t)
+    {
+        t = NormalizeDashes(t);
+
+        if (!HasDashSeparator(t)) return false;
+        if (t.Length < 12 || t.Length > 220) return false;
+
+        // numeración tipo 1.1
+        if (Regex.IsMatch(t, @"^\d+(\.\d+)*\s+", RegexOptions.IgnoreCase)) return false;
+
+        // filtrar categorías típicas
+        var low = t.ToLowerInvariant();
+        var forbidden = new[]
+        {
+            "muy importante", "relevante", "ordinaria",
+            "estado crítico", "otros proyectos",
+            "oportunidades comerciales", "otra actividad comercial",
+            "visión general", "proyectos en ejecución"
+        };
+        if (forbidden.Any(f => low.Contains(f))) return false;
+
+        // evita títulos demasiado “genéricos”
+        if (low is "relevante" or "ordinaria" or "muy importante") return false;
+
+        return true;
+    }
+
+    private static bool IsSectionOrCategoryTitle(string t)
+    {
+        var up = NormalizeDashes(t).Trim().ToUpperInvariant();
+
+        if (Regex.IsMatch(up, @"^\d+(\.\d+)*\s+", RegexOptions.IgnoreCase)) return true;
+
+        var exact = new HashSet<string>
+        {
+            "ESTADO CRÍTICO",
+            "OTROS PROYECTOS",
+            "MUY IMPORTANTE",
+            "RELEVANTE",
+            "ORDINARIA"
+        };
+        if (exact.Contains(up)) return true;
+
+        if (up.Contains("PROYECTOS EN EJECUCIÓN")) return true;
+        if (up.Contains("OPORTUNIDADES COMERCIALES")) return true;
+        if (up.Contains("OTRA ACTIVIDAD COMERCIAL")) return true;
+        if (up.Contains("VISIÓN GENERAL")) return true;
+
+        return false;
+    }
+
+    private static string Clean(string s)
+    {
+        s = (s ?? "").Replace("**", "");
+        return Regex.Replace(s, @"\s+", " ").Trim();
+    }
+
+    private static string Norm(string s)
+    {
+        s = (s ?? "").ToLowerInvariant().Trim();
+        s = Regex.Replace(s, @"\s+", " ");
+        s = Regex.Replace(s, @"[^\p{L}\p{N}\s]", "");
+        return s;
+    }
+
+    private static string SafeTitle(Item it)
+    {
+        var t = it.Title?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(t)) t = "Sin título";
+        return t;
+    }
+
+    private static int? FindAnchorByClient(List<Item> items, string client)
+    {
+        var c = Norm(client);
+        if (string.IsNullOrWhiteSpace(c)) return null;
+
+        foreach (var it in items)
+            if (!string.IsNullOrWhiteSpace(it.Client) && Norm(it.Client) == c)
+                return it.AnchorTitle;
+
+        return null;
+    }
+
+    // =========================================================
+    // MATCHING POR SIMILITUD (sin “tokens fuertes” agresivos)
+    // =========================================================
+    private static Dictionary<int, int> MatchItemsBySimilarity(List<Item> v1, List<Item> v2, double threshold)
+    {
+        var map = new Dictionary<int, int>(); // v2Index -> v1Index
+        var usedV1 = new HashSet<int>();
+
+        for (int i2 = 0; i2 < v2.Count; i2++)
+        {
+            double best = 0;
+            int bestI1 = -1;
+
+            for (int i1 = 0; i1 < v1.Count; i1++)
+            {
+                if (usedV1.Contains(i1)) continue;
+
+                // similitud principalmente por título (más estable que mezclar description)
+                var scoreTitle = Similarity(v2[i2].Title, v1[i1].Title);
+                var scoreSig = Similarity(v2[i2].Signature, v1[i1].Signature);
+
+                // mezcla: título pesa más
+                var score = (0.75 * scoreTitle) + (0.25 * scoreSig);
+
+                // bonus si cliente coincide (cuando lo tenemos)
+                if (!string.IsNullOrWhiteSpace(v2[i2].Client) &&
+                    !string.IsNullOrWhiteSpace(v1[i1].Client) &&
+                    Norm(v2[i2].Client) == Norm(v1[i1].Client))
+                    score += 0.08;
+
+                if (score > best)
+                {
+                    best = score;
+                    bestI1 = i1;
+                }
+            }
+
+            if (bestI1 >= 0 && best >= threshold)
+            {
+                map[i2] = bestI1;
+                usedV1.Add(bestI1);
             }
         }
 
-        if (titleParts.Count > 0)
-            return string.Join(" · ", titleParts.Take(3));
-
-        return lines.FirstOrDefault() ?? "Bloque";
+        return map;
     }
 
-    // ====== 3) Comparación ======
-    private static List<DeltaItem> Compare(List<Block> baseline, List<Block> current)
+    private static double Similarity(string a, string b)
     {
-        var baseMap = baseline.ToDictionary(b => b.itemKey, b => b);
+        var A = Tokenize(a);
+        var B = Tokenize(b);
+        if (A.Count == 0 && B.Count == 0) return 1;
+        if (A.Count == 0 || B.Count == 0) return 0;
 
-        var deltas = new List<DeltaItem>();
-        foreach (var cur in current)
-        {
-            baseMap.TryGetValue(cur.itemKey, out var prev);
-            var (tag, sev, note) = EvaluateDelta(prev, cur);
-
-            deltas.Add(new DeltaItem(cur.itemKey, cur.title, tag, sev, note, prev, cur));
-        }
-
-        return deltas
-            .OrderByDescending(d => d.severity)
-            .ThenBy(d => d.title)
-            .ToList();
-    }
-
-    private static (Tag tag, Severity severity, string note) EvaluateDelta(Block? prev, Block cur)
-    {
-        if (prev == null)
-            return (Tag.New, Severity.Medium, "Aparece este bloque por primera vez en el informe actual.");
-
-        // NUEVO RIESGO
-        if (!prev.hasRiskFlag && cur.hasRiskFlag)
-            return (Tag.NewRisk, Severity.High, "Aparece marcado como [RIESGO] en la semana actual.");
-
-        // SIN NOVEDAD -> ahora hay acciones
-        if (prev.isSinNovedad && !cur.isSinNovedad)
-        {
-            var sev = cur.hasRiskFlag ? Severity.High : Severity.Medium;
-            return (Tag.Updated, sev, "Pasa de 'Sin novedad' a incluir acciones/seguimiento.");
-        }
-
-        // Confirmaciones típicas
-        if (HasConfirmations(cur.body) && !HasConfirmations(prev.body))
-        {
-            var sev = cur.hasRiskFlag ? Severity.High : Severity.Medium;
-            return (Tag.Updated, sev, "Se concreta información que antes era preliminar.");
-        }
-
-        // Actualización por cambio de contenido
-        var similarity = RoughSimilarity(prev.body, cur.body);
-        if (similarity < 0.70)
-        {
-            var sev = cur.hasRiskFlag ? Severity.Medium : Severity.Low;
-            return (Tag.Updated, sev, "Contenido actualizado respecto a la semana anterior.");
-        }
-
-        return (Tag.NoChange, Severity.Low, "Sin cambios relevantes detectados.");
-    }
-
-    private static bool HasConfirmations(string s)
-        => Regex.IsMatch(s, @"\b(confirmad|confirmado|arrancan|arranca|nuestro tl será|liderará|movimiento de tl)\b",
-            RegexOptions.IgnoreCase);
-
-    private static double RoughSimilarity(string a, string b)
-    {
-        var ta = Tokenize(a);
-        var tb = Tokenize(b);
-        if (ta.Count == 0 && tb.Count == 0) return 1.0;
-        if (ta.Count == 0 || tb.Count == 0) return 0.0;
-
-        var inter = ta.Intersect(tb).Count();
-        var uni = ta.Union(tb).Count();
+        var inter = A.Intersect(B).Count();
+        var uni = A.Union(B).Count();
         return uni == 0 ? 0 : (double)inter / uni;
     }
 
     private static HashSet<string> Tokenize(string s)
     {
-        var norm = Normalize(s);
-        var tokens = norm.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        return tokens.Where(t => t.Length > 2).ToHashSet();
+        s = Norm(s);
+
+        var stop = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "de","la","el","y","en","a","por","para","con","sin","un","una","los","las",
+            "que","se","su","al","del","lo","como","más","menos","muy","ya","no","si",
+            "proyecto","squad","producto","vertical","estado","otros"
+        };
+
+        var parts = s.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in parts)
+        {
+            if (p.Length < 4) continue;
+            if (stop.Contains(p)) continue;
+            set.Add(p);
+        }
+        return set;
     }
 
-    // ====== 4) DOCX resultado ======
-    private static byte[] BuildDeltaDocx(List<DeltaItem> deltas, Metadata? meta, Options opts)
+    // =========================================================
+    // ACTUALIZACIONES NUMÉRICAS (direccional)
+    // =========================================================
+    private static List<string> CompareNumbers_Directional(string oldText, string newText)
+    {
+        var msgs = new List<string>();
+
+        // porcentajes: si cambia el conjunto, reportamos old -> new
+        var oldPct = ExtractPercentages(oldText).OrderBy(x => x).ToList();
+        var newPct = ExtractPercentages(newText).OrderBy(x => x).ToList();
+
+        if (oldPct.Count > 0 || newPct.Count > 0)
+        {
+            if (!oldPct.SequenceEqual(newPct))
+            {
+                var o = oldPct.Count > 0 ? string.Join(", ", oldPct.Select(x => $"{x}%")) : "—";
+                var n = newPct.Count > 0 ? string.Join(", ", newPct.Select(x => $"{x}%")) : "—";
+                msgs.Add($"Cambio de porcentaje: {o} → {n}.");
+            }
+        }
+
+        // euros: reporta cambio de tokens € (simple)
+        var oldEur = ExtractEuros(oldText).OrderBy(x => x).ToList();
+        var newEur = ExtractEuros(newText).OrderBy(x => x).ToList();
+
+        if (oldEur.Count > 0 || newEur.Count > 0)
+        {
+            if (!oldEur.SequenceEqual(newEur))
+            {
+                var o = oldEur.Count > 0 ? string.Join(", ", oldEur) : "—";
+                var n = newEur.Count > 0 ? string.Join(", ", newEur) : "—";
+                msgs.Add($"Cambio de importe: {o} → {n}.");
+            }
+        }
+
+        return msgs;
+    }
+
+    private static List<int> ExtractPercentages(string text)
+    {
+        var list = new List<int>();
+        foreach (Match m in Regex.Matches(text, @"(\d{1,3})\s*%", RegexOptions.IgnoreCase))
+        {
+            if (int.TryParse(m.Groups[1].Value, out var pct))
+                list.Add(pct);
+        }
+        return list.Distinct().ToList();
+    }
+
+    private static List<string> ExtractEuros(string text)
+    {
+        var list = new List<string>();
+        foreach (Match m in Regex.Matches(text, @"(\d{1,3}(\.\d{3})+|\d+)(,\d+)?\s*(k€|k|€)", RegexOptions.IgnoreCase))
+        {
+            list.Add(m.Value.Trim());
+        }
+        return list.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    // =========================================================
+    // TOKEN DELTA (fallback)
+    // =========================================================
+    private record TokenDeltaResult(double ChangeRatio, string AddedSummary, string RemovedSummary);
+
+    private static TokenDeltaResult TokenDelta(string a, string b)
+    {
+        var A = Tokenize(a);
+        var B = Tokenize(b);
+
+        if (A.Count == 0 && B.Count == 0) return new(0, "—", "—");
+
+        var added = B.Except(A).ToList();
+        var removed = A.Except(B).ToList();
+        var union = A.Union(B).Count();
+        var ratio = union == 0 ? 0 : (double)(added.Count + removed.Count) / union;
+
+        return new(
+            ratio,
+            added.Count == 0 ? "—" : string.Join(", ", added.Take(10)),
+            removed.Count == 0 ? "—" : string.Join(", ", removed.Take(10))
+        );
+    }
+
+    // =========================================================
+    // BORRAR TODOS LOS COMENTARIOS Y CREAR SOLO JUANA
+    // =========================================================
+    private static byte[] ReplaceAllCommentsWithJuana(byte[] v2Bytes, List<ChangeItem> changes, string author, string initials)
     {
         using var ms = new MemoryStream();
-        using (var doc = WordprocessingDocument.Create(ms, WordprocessingDocumentType.Document))
+        ms.Write(v2Bytes, 0, v2Bytes.Length);
+        ms.Position = 0;
+
+        using (var doc = WordprocessingDocument.Open(ms, true))
         {
-            var main = doc.AddMainDocumentPart();
-            main.Document = new Document(new Body());
-            var body = main.Document.Body!;
+            var main = doc.MainDocumentPart ?? throw new InvalidOperationException("MainDocumentPart no encontrado.");
+            main.Document ??= new Document(new Body());
+            main.Document.Body ??= new Body();
 
-            body.Append(MakeHeading($"Delta semanal – {meta?.mercado ?? "Mercado"} – {meta?.gerente ?? "Gerente"}", 1));
-            body.Append(MakeParagraph($"Comparación: {meta?.baselineDate ?? "baseline"} → {meta?.currentDate ?? "current"}"));
-            body.Append(MakeParagraph(" "));
+            RemoveAllCommentAnchors(main.Document);
 
-            if (opts.includeHighlights == true)
+            if (main.WordprocessingCommentsPart != null)
+                main.DeletePart(main.WordprocessingCommentsPart);
+
+            var commentsPart = main.AddNewPart<WordprocessingCommentsPart>();
+            commentsPart.Comments = new Comments();
+
+            var paragraphs = main.Document.Body.Elements<Paragraph>().ToList();
+            if (paragraphs.Count == 0)
             {
-                body.Append(MakeHeading("Cambios relevantes de la semana", 2));
-
-                var highlights = deltas
-                    .Where(d => d.severity >= Severity.High && d.tag != Tag.NoChange)
-                    .Take(opts.maxHighlights ?? 12)
-                    .ToList();
-
-                if (highlights.Count == 0)
-                    body.Append(MakeParagraph("No se detectan cambios de severidad alta/crítica."));
-                else
-                    foreach (var h in highlights)
-                        body.Append(MakeBullet($"{FormatTag(h.tag)} {h.title} — {h.note}"));
-
-                body.Append(MakeParagraph(" "));
+                main.Document.Body.AppendChild(new Paragraph(new Run(new Text(" ") { Space = SpaceProcessingModeValues.Preserve })));
+                paragraphs = main.Document.Body.Elements<Paragraph>().ToList();
             }
 
-            body.Append(MakeHeading("Detalle por bloques", 2));
-
-            foreach (var d in deltas)
+            int id = 1;
+            foreach (var ch in changes)
             {
-                if (opts.significantOnly == true && d.tag == Tag.NoChange) continue;
+                var idx = Math.Clamp(ch.AnchorIndex, 0, paragraphs.Count - 1);
+                var p = paragraphs[idx];
 
-                body.Append(MakeHeading($"{FormatTag(d.tag)} {d.title}", 3));
-                body.Append(MakeParagraph($"Severidad: {d.severity}. {d.note}"));
-                body.Append(MakeParagraph(" "));
+                var idStr = id.ToString();
+                id++;
+
+                var comment = new Comment
+                {
+                    Id = idStr,
+                    Author = author,
+                    Initials = initials,
+                    Date = DateTime.Now
+                };
+
+                comment.AppendChild(new Paragraph(
+                    new Run(new Text($"{ch.Tag} {ch.Message}") { Space = SpaceProcessingModeValues.Preserve })
+                ));
+
+                commentsPart.Comments.AppendChild(comment);
+                AnchorCommentToParagraph(p, idStr);
             }
 
+            commentsPart.Comments.Save();
             main.Document.Save();
         }
 
         return ms.ToArray();
     }
 
-    private static Summary BuildSummary(List<DeltaItem> deltas)
+    private static void RemoveAllCommentAnchors(Document document)
     {
-        int critical = deltas.Count(d => d.severity == Severity.Critical);
-        int high     = deltas.Count(d => d.severity == Severity.High);
-        int medium   = deltas.Count(d => d.severity == Severity.Medium);
-        int low      = deltas.Count(d => d.severity == Severity.Low);
+        var body = document.Body;
+        if (body == null) return;
 
-        int newRisk  = deltas.Count(d => d.tag == Tag.NewRisk);
-        int updated  = deltas.Count(d => d.tag == Tag.Updated || d.tag == Tag.New);
-        int noChange = deltas.Count(d => d.tag == Tag.NoChange);
-
-        return new Summary(critical, high, medium, low, newRisk, updated, noChange);
+        foreach (var el in body.Descendants<CommentRangeStart>().ToList()) el.Remove();
+        foreach (var el in body.Descendants<CommentRangeEnd>().ToList()) el.Remove();
+        foreach (var el in body.Descendants<CommentReference>().ToList()) el.Remove();
     }
 
-    private static string BuildFileName(Metadata? meta)
+    private static void AnchorCommentToParagraph(Paragraph paragraph, string commentId)
     {
-        var mercado = SafeFile(meta?.mercado ?? "Mercado");
-        var gerente = SafeFile(meta?.gerente ?? "Gerente");
-        var date = SafeFile(meta?.currentDate ?? DateTime.UtcNow.ToString("yyyy-MM-dd"));
-        return $"Delta_{mercado}_{gerente}_{date}.docx";
-    }
-
-    // ====== Helpers ======
-    private static Paragraph MakeHeading(string text, int level)
-    {
-        var p = new Paragraph();
-        var pPr = new ParagraphProperties
+        var firstRun = paragraph.Elements<Run>().FirstOrDefault();
+        if (firstRun == null)
         {
-            ParagraphStyleId = new ParagraphStyleId { Val = $"Heading{level}" }
-        };
-        p.Append(pPr);
-        p.Append(new Run(new Text(text)));
-        return p;
-    }
+            firstRun = new Run(new Text(" ") { Space = SpaceProcessingModeValues.Preserve });
+            paragraph.AppendChild(firstRun);
+        }
 
-    private static Paragraph MakeParagraph(string text)
-        => new Paragraph(new Run(new Text(text)));
-
-    private static Paragraph MakeBullet(string text)
-        => new Paragraph(new Run(new Text("• " + text)));
-
-    private static string FormatTag(Tag tag) => tag switch
-    {
-        Tag.NewRisk => "[NUEVO RIESGO]",
-        Tag.Updated => "[ACTUALIZACIÓN]",
-        Tag.New     => "[NUEVO]",
-        _           => "[SIN CAMBIOS]"
-    };
-
-    private static string Normalize(string s)
-    {
-        var lower = s.ToLowerInvariant();
-        lower = Regex.Replace(lower, @"[^\p{L}\p{N}\s]", " ");
-        lower = Regex.Replace(lower, @"\s+", " ").Trim();
-        return lower;
-    }
-
-    private static string Sha1(string s)
-    {
-        var bytes = Encoding.UTF8.GetBytes(s);
-        var hash = SHA1.HashData(bytes);
-        return Convert.ToHexString(hash).ToLowerInvariant();
-    }
-
-    private static string SafeFile(string s)
-    {
-        foreach (var c in Path.GetInvalidFileNameChars())
-            s = s.Replace(c, '_');
-        return s.Replace(" ", "_");
+        paragraph.InsertBefore(new CommentRangeStart { Id = commentId }, firstRun);
+        var end = new CommentRangeEnd { Id = commentId };
+        paragraph.InsertAfter(end, firstRun);
+        paragraph.InsertAfter(new Run(new CommentReference { Id = commentId }), end);
     }
 }

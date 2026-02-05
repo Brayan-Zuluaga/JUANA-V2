@@ -1,6 +1,6 @@
 using System.Net;
 using System.Text.Json;
-using DocumentFormat.OpenXml; // ✅ necesario para SpaceProcessingModeValues
+using DocumentFormat.OpenXml; // SpaceProcessingModeValues
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Wordprocessing;
 using Microsoft.Azure.Functions.Worker;
@@ -50,9 +50,16 @@ public class DocxProcess
                 return bad;
             }
 
-            byte[] fileBytes = Convert.FromBase64String(input.docxBase64);
+            // ✅ Si alguna vez viniera con prefijo data:...;base64, lo limpiamos
+            var cleanBase64 = input.docxBase64.Contains(",")
+                ? input.docxBase64.Split(',').Last()
+                : input.docxBase64;
 
-            using var ms = new MemoryStream(fileBytes);
+            byte[] fileBytes = Convert.FromBase64String(cleanBase64);
+
+            // ✅ FIX: stream expandible (evita "Memory stream is not expandable")
+            using var ms = new MemoryStream();
+            ms.Write(fileBytes, 0, fileBytes.Length);
             ms.Position = 0;
 
             using (var wordDoc = WordprocessingDocument.Open(ms, true))
@@ -64,21 +71,86 @@ public class DocxProcess
 
                 var bodyDoc = mainPart.Document.Body;
 
-                // ✅ Crear párrafo nuevo (preserva espacios)
-                var paragraph = new Paragraph(
-                    new Run(
-                        new Text(input.textToAppend)
-                        {
-                            Space = SpaceProcessingModeValues.Preserve
-                        }
+                // ------------------------------------------------------------------
+                // 1) ✅ Añadir el texto al final (como ya lo hacías)
+                // ------------------------------------------------------------------
+                var paragraph = new Paragraph();
+
+                var runWithText = new Run(
+                    new Text(input.textToAppend)
+                    {
+                        Space = SpaceProcessingModeValues.Preserve
+                    }
+                );
+
+                paragraph.Append(runWithText);
+
+                // ✅ Añadimos el párrafo al final del documento
+                bodyDoc.AppendChild(paragraph);
+
+                // ------------------------------------------------------------------
+                // 2) ✅ Añadir un comentario que señalice que el texto fue añadido por JUANA
+                //     Comentario anclado sobre el texto recién insertado.
+                // ------------------------------------------------------------------
+
+                // ✅ Crear/asegurar CommentsPart
+                var commentsPart = mainPart.GetPartsOfType<WordprocessingCommentsPart>().FirstOrDefault();
+                if (commentsPart == null)
+                {
+                    commentsPart = mainPart.AddNewPart<WordprocessingCommentsPart>();
+                    commentsPart.Comments = new Comments();
+                }
+                else if (commentsPart.Comments == null)
+                {
+                    commentsPart.Comments = new Comments();
+                }
+
+                // ✅ ID único de comentario (evita colisiones)
+                var existingIds = commentsPart.Comments.Elements<Comment>()
+                    .Select(c => int.TryParse(c.Id?.Value, out var n) ? n : 0);
+
+                var commentId = (existingIds.Any() ? existingIds.Max() : 0) + 1;
+                var commentIdStr = commentId.ToString();
+
+                // ✅ Contenido del comentario (lo que se verá en el panel lateral)
+                var comment = new Comment()
+                {
+                    Id = commentIdStr,
+                    Author = "JUANA",
+                    Date = DateTime.UtcNow
+                };
+
+                comment.AppendChild(
+                    new Paragraph(
+                        new Run(
+                            new Text("Texto añadido por JUANA")
+                            {
+                                Space = SpaceProcessingModeValues.Preserve
+                            }
+                        )
                     )
                 );
 
-                // ✅ Añadir al final
-                bodyDoc.AppendChild(paragraph);
+                commentsPart.Comments.AppendChild(comment);
+                commentsPart.Comments.Save();
+
+                // ✅ “Anclar” el comentario al texto del párrafo insertado:
+                //    - Start antes del run
+                //    - End después del run
+                //    - Reference al final (para que Word lo renderice)
+                var start = new CommentRangeStart() { Id = commentIdStr };
+                var end = new CommentRangeEnd() { Id = commentIdStr };
+                var referenceRun = new Run(new CommentReference() { Id = commentIdStr });
+
+                paragraph.InsertBefore(start, runWithText);
+                paragraph.InsertAfter(end, runWithText);
+                paragraph.Append(referenceRun);
+
+                // ✅ Guardar documento
                 mainPart.Document.Save();
             }
 
+            // ✅ Respuesta JSON con el DOCX modificado en base64
             var response = req.CreateResponse(HttpStatusCode.OK);
             response.Headers.Add("Content-Type", "application/json");
 
